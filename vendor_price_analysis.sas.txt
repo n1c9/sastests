@@ -1,0 +1,689 @@
+/*****************************************************************************
+ *  vendor_price_analysis.sas   - ONE program, THREE steps
+ *
+ *  STEP 1   Ingest the vendor PRICE LIST, read automatically from every
+ *           file in &folder whose name contains &price_key (a word you
+ *           type in below). Delimiter (tab / pipe / comma / semicolon) is
+ *           auto-detected unless you preset &delim. The header row is
+ *           printed to the log as position => name; column &price_itemid
+ *           is the item id. After the header is read you specify which
+ *           columns are PRICE TIERS (interactive window prompt, or preset
+ *           %let tier_cols). The chosen columns are imported NUMERIC
+ *           (P1..P&ntier); other non-id columns are CHARACTER (C1..C&nmeta).
+ *           Dynamic macro &tierlist drives the comparison in step 3.
+ *  STEP 2   Read every purchase file in &folder whose name contains
+ *           &purchase_key. If several match they MUST have the exact same
+ *           schema (same column count, names and delimiter) - they are then
+ *           merged into one purchase table (customerid, item, units, charges)
+ *           using column positions &sale_cust / &sale_item / &sale_qty /
+ *           &sale_charges. A de-duplicated tier lookup (pt_key) is built.
+ *  STEP 3   Compare. For each purchase row the payment PER UNIT
+ *           (round(charges/units, 0.01)) is looked up against that item's
+ *           tier prices. Usage is counted by purchase records AND by total
+ *           units. Rows charged 0 are tracked as "zero dollar amount" and
+ *           excluded from tier usage. Output is written as a CSV:
+ *             TierName,UsageCount,TotalUnits   (used_price_tiers.csv)
+ *
+ *  File discovery : &folder is scanned for *.&ext files containing the key
+ *  words; the detected delimiter is always NOTEed in the log. Any file whose
+ *  schema disagrees with the others aborts the run with a clear ERROR.
+ *  All character column lengths are dynamic (longest observed value).
+ *  Large purchase files use single-pass filevar reads (no big sorts).
+ *****************************************************************************/
+
+/* ====================== CONFIG - edit before running ================= */
+%let workarea     = C:\sas_vendor_pricing; /* output root (session macro)  */
+%let folder       = &workarea.\data;       /* where the input .txt files are */
+%let price_key    = prices;                /* word in the PRICE file name(s);
+                                              blank => use &pricefile       */
+%let purchase_key = sales;                 /* word in the PURCHASE file name(s);
+                                              blank => use &purchases       */
+%let ext          = txt;                   /* only files with this extension */
+%let delim        = AUTO;                  /* AUTO | TAB | | | , | ;        */
+%let price_itemid = 1;                     /* item id column in PRICE file  */
+%let sale_cust    = 1;                     /* customer id column in PURCHASE */
+%let sale_item    = 2;                     /* item id column in PURCHASE    */
+%let sale_qty     = 3;                     /* units column in PURCHASE      */
+%let sale_charges = 4;                     /* charges column in PURCHASE    */
+%let tier_cols    = ;                      /* price tier columns; blank=>ask */
+%let pricefile    = ;                      /* fallback single PRICE file    */
+%let purchases    = ;                      /* fallback single PURCHASE file */
+%let outcsv       = used_price_tiers.csv;  /* result file in &workarea      */
+
+options compress = yes nofullstimer;
+
+/* ====================== USER-DEFINED MACROS ========================= */
+/* Expand a user-supplied column list ("3 5 7" / "3-5,9") to positions  */
+%macro _expand(in);
+  %local tok i a b out;
+  %let out = ;
+  %let in  = %sysfunc(tranwrd(%superq(in), %str(,), %str( )));
+  %let in  = %sysfunc(compbl(%superq(in)));
+  %do %while (%length(%scan(&in, 1, %str( ))) > 0);
+    %let tok = %scan(&in, 1, %str( ));
+    %let in  = %substr(%superq(in), %eval(%length(&tok) + 2));
+    %if %index(&tok, -) > 0 %then %do;
+      %let a = %scan(&tok, 1, -);
+      %let b = %scan(&tok, 2, -);
+      %do i = &a %to &b;
+        %let out = &out &i;
+      %end;
+    %end;
+    %else %let out = &out &tok;
+  %end;
+  &out
+%mend;
+
+/* interactive (Base SAS windowing) vs batch/EG/Studio? ------------------ */
+%macro _interactive;
+  %global _inter;
+  %let _inter = %sysfunc(session());
+  %if %bquote(&_inter) = %then %let _inter = 0;
+  %else %let _inter = 1;
+%mend;
+
+/* map a configured &delim value to byte + name; AUTO leaves dlb blank --- */
+%macro _dlmset;
+  %global dlb dln;
+  %if %upcase(&delim) = TAB       %then %do; %let dlb = 9;   %let dln = TAB;       %end;
+  %else %if %upcase(&delim) = PIPE or %superq(delim) = %str(|) %then
+                                     %do; %let dlb = 124; %let dln = PIPE;     %end;
+  %else %if %upcase(&delim) = COMMA or %superq(delim) = %str(,) %then
+                                     %do; %let dlb = 44;  %let dln = COMMA;    %end;
+  %else %if %upcase(&delim) = SEMICOLON or %superq(delim) = %str(;) %then
+                                     %do; %let dlb = 59;  %let dln = SEMICOLON;%end;
+  %else %if %upcase(&delim) = AUTO  %then %do; %let dlb = ;   %let dln = AUTO;      %end;
+  %else %do;
+    %put ERROR: delim=&delim not recognized - use AUTO, TAB, |, , or ;.;
+    %abort cancel;
+  %end;
+%mend;
+
+/* detect the delimiter of one file (first 5 lines), stores &dlb &dln ---- */
+%macro _detect_delim(fp);
+  %global dlb dln;
+  data _null_;
+    length line $ 32767;
+    infile "&fp" lrecl = 32767 truncover end = last;
+    input @1 line $char32767.;
+    if _n_ <= 5 then do;
+      tt + countc(line, '09'x);
+      pp + countc(line, '7C'x);
+      cc + countc(line, ',');
+      ss + countc(line, ';');
+    end;
+    if (last or _n_ = 5) then do;
+      if tt >= pp and tt >= cc and tt >= ss then do; b = 9;   nm = 'TAB';       end;
+      else if pp >= cc and pp >= ss then do; b = 124; nm = 'PIPE';     end;
+      else if cc >= ss then do; b = 44;  nm = 'COMMA';    end;
+      else do; b = 59;  nm = 'SEMICOLON'; end;
+      call symputx('dlb', put(b, 3.));
+      call symputx('dln', nm);
+      stop;
+    end;
+  run;
+%mend;
+
+/* scan &folder for *.&ext files whose name contains &key; builds         */
+/* &tag.1.. with full paths and &tag_n = count (global macro vars)        */
+%macro _pick_files(key, tag);
+  %global &tag._n;
+  data work._&tag._files;
+    length fname $ 512 fpath $ 1000;
+    set work._ddir;
+    up = upcase(fname);
+    upkey = upcase("&key");
+    if length(compress(fname)) and index(up, upkey) > 0 then do;
+      dot = find(up, '.', -length(up));
+      ext = ifc(dot > 0, substr(up, dot + 1), ' ');
+      if ext = upcase("&ext") then output;
+    end;
+    keep fname fpath;
+    fpath = "&folder." || '\' || strip(fname);
+  run;
+  proc sql noprint;
+    select count(*) into :tp trimmed from work._&tag._files;
+  quit;
+  %let &tag._n = &tp;
+  data _null_;
+    set work._&tag._files;
+    call symputx(cats("&tag", _n_), fpath);
+  run;
+  %put NOTE: [&tag] matched &&&tag._n file(s) containing "&key":;
+  %do _i = 1 %to &&&tag._n;
+    %put        (_i) &&&tag&_i;
+  %end;
+%mend;
+
+/* per-file delimiter check + schema check for a group of files; sets     */
+/* globals _db (byte), _dn (name), _hn (col count), _h1.._hN (raw names)  */
+%macro _prep_group(tag, gname, ctr);
+  %global _db _dn _hn;
+  %local i;
+  %do i = 1 %to &ctr;
+    %let _f = &&&tag&i;
+    %if &dln = AUTO %then %do;
+      %_detect_delim(&_f);
+      %let db_&i = &dlb;
+      %let dln_&i = &dln;
+    %end;
+    %else %do;
+      %let db_&i = &dlb;
+      %let dln_&i = &dln;
+    %end;
+    data _null_;
+      length line $ 32767;
+      infile "&_f" obs = 1 lrecl = 32767 truncover;
+      input @1 line $char32767.;
+      n = countc(line, byte(&&db_&i)) + 1;
+      sig = ' ';
+      do k = 1 to n;
+        t = strip(compress(scan(line, k, byte(&&db_&i), 'm'), '"'));
+        if k = 1 then sig = upcase(t);
+        else sig = catx('~', sig, upcase(t));
+        call symputx(cats('_h', k), t);
+      end;
+      call symputx('_hn', put(n, 8.));
+      call symputx('_sig', sig);
+    run;
+    %let hn_&i = &_hn;
+    %let sig_&i = &_sig;
+  %end;
+  %do i = 2 %to &ctr;
+    %if &&hn_&i ne &hn_1 %then %do;
+      %put ERROR: [&gname] file &i has a different column count than file 1 (&&hn_&i vs &hn_1).;
+      %put        file 1 : &&&tag1;
+      %put        file &i: &&&tag&i;
+      %abort cancel;
+    %end;
+    %if %qupcase(&&sig_&i) ne %qupcase(&sig_1) %then %do;
+      %put ERROR: [&gname] file &i header differs from file 1.;
+      %put        file 1     : &sig_1;
+      %put        file &i: &&sig_&i;
+      %abort cancel;
+    %end;
+    %if &dln = AUTO %then %do;
+      %if &&db_&i ne &db_1 %then %do;
+        %put ERROR: [&gname] file &i uses a different delimiter than file 1 (&&dln_&i vs &dln_1).;
+        %put        file 1 : &&&tag1;
+        %put        file &i: &&&tag&i;
+        %abort cancel;
+      %end;
+    %end;
+  %end;
+  %let _db = &db_1;
+  %let _dn = &dln_1;
+  %let _hn = &hn_1;
+  %put NOTE: Detected delimiter for &gname: &_dn (byte &_db).;
+  %put NOTE: &gname header - &_hn columns: %do _k = 1 %to &_hn; &&_h&_k %end;;
+%mend;
+
+/* interactive window: tier columns, price item id, purchase item id ----- */
+%macro _ask_inputs;
+  %global pidcols ppitem pitem;
+  %let pidcols = &tier_cols;
+  %let ppitem  = &price_itemid;
+  %let pitem   = &sale_item;
+  %if &_inter = 1 %then %do;
+    %window ask color=white irow=6 icol=6
+      #1  @2 "PRICE TIER column positions (space separated, e.g. 3 4 5)."
+      #2  @2 "Leave empty = every column except the item-id is a tier."
+      #4  @2 "tier columns :" pidcols 60
+      #6  @2 "PRICE file item-id column position   [{&price_itemid}] :" ppitem 8
+      #7  @2 "PURCHASE file item-id column position [{&sale_item}] :"   pitem  8
+      #10 @2 "Press ENTER to accept.";
+    %display ask;
+    %if %length(%sysfunc(compbl(%superq(pidcols)))) %then %let tier_cols = %sysfunc(compbl(%superq(pidcols)));
+    %if %length(%sysfunc(compbl(%superq(ppitem)))) %then %let price_itemid = %sysfunc(compbl(%superq(ppitem)));
+    %if %length(%sysfunc(compbl(%superq(pitem))))  %then %let sale_item    = %sysfunc(compbl(%superq(pitem)));
+  %end;
+  %else %do;
+    %if %length(%superq(tier_cols)) = 0 %then %do;
+      %put ERROR: batch/EG/Studio session detected - interactive prompt unavailable.;
+      %put        Preset tier_cols, price_itemid and sale_item in the CONFIG section.;
+      %abort cancel;
+    %end;
+  %end;
+%mend;
+
+/* expand tier_cols -> positions T1..Tn, &tierlist, &ntier, meta M1..Mm,  */
+/* &nmeta, tier display names TN1..TNn (all GLOBAL)                       */
+%macro _expand_tiers;
+  %global ntier nmeta tierlist;
+  %local i j _tp tok;
+  %if %length(%superq(tier_cols)) = 0 %then %do;
+    %let tierlist = ;
+    %do i = 1 %to &_hn;
+      %if &i ne &price_itemid %then %let tierlist = &tierlist &i;
+    %end;
+    %let tier_cols = &tierlist;
+  %end;
+  %let tierlist = %_expand(%superq(tier_cols));
+  %let ntier = 0;
+  %do %while (%length(%scan(&tierlist, 1, %str( ))) > 0);
+    %let tok = %scan(&tierlist, 1, %str( ));
+    %let tierlist = %substr(%superq(tierlist), %eval(%length(&tok) + 2));
+    %if (%sysfunc(anydigit(&tok)) = 0)
+        or not (%eval(&tok >= 1) and %eval(&tok <= &_hn)) %then %do;
+      %put ERROR: &tok is not a valid column position (1..&_hn).;
+      %abort cancel;
+    %end;
+    %if (&tok = &price_itemid) %then %do;
+      %put ERROR: Column &tok is the item id column, not a price tier.;
+      %abort cancel;
+    %end;
+    %let ntier = %eval(&ntier + 1);
+    %global T&ntier TN&ntier;
+    %let T&ntier = &tok;
+    %do j = 1 %to %eval(&ntier - 1);
+      %if (&&T&j = &tok) %then %do;
+        %put ERROR: Duplicate tier position &tok.;
+        %abort cancel;
+      %end;
+    %end;
+  %end;
+  %if &ntier = 0 %then %do;
+    %put ERROR: At least one price tier column is required.;
+    %abort cancel;
+  %end;
+  %do i = 1 %to &ntier;
+    %let _tp = &&T&i;
+    %let TN&i = &&_h&_tp;
+  %end;
+  %let nmeta = 0;
+  %do i = 1 %to &_hn;
+    %let is = 0;
+    %if (&i = &price_itemid) %then %let is = 1;
+    %do j = 1 %to &ntier;
+      %if (&&T&j = &i) %then %let is = 1;
+    %end;
+    %if (&is = 0) %then %do;
+      %let nmeta = %eval(&nmeta + 1);
+      %global M&nmeta;
+      %let M&nmeta = &i;
+    %end;
+  %end;
+  %put NOTE: STEP 1 - price tiers imported as NUMERIC : %do k = 1 %to &ntier; &&T&k %end;;
+  %put NOTE: STEP 1 - character modifier columns      : %do j = 1 %to &nmeta; &&M&j %end;;
+%mend;
+
+/* =========================================================== */
+/* ====================== STEP 0 - SETUP ===================== */
+/* =========================================================== */
+
+%if %sysfunc(libref(workarea)) %then libname workarea "&workarea";
+%let folder = &workarea.\data;
+%if not %sysfunc(fileexist(&folder)) %then %do;
+  %put ERROR: input folder &folder does not exist.;
+  %abort cancel;
+%end;
+
+filename _ddir pipe "dir /b ""&folder""";
+data work._ddir;
+  length fname $ 512;
+  infile _ddir truncover;
+  input @1 fname $char512.;
+  if compress(fname) ne ' ';
+  keep fname;
+run;
+
+%_interactive;
+%_dlmset;
+
+/* pick + prep PRICE files --------------------------------------------- */
+%if %length(%superq(price_key)) > 0 %then %do;
+  %_pick_files(&price_key, price);
+  %if &price_n = 0 %then %do;
+    %put ERROR: no *.&ext files in &folder contain "&price_key".;
+    %abort cancel;
+  %end;
+%end;
+%else %do;
+  %if %length(%superq(pricefile)) = 0 %then %do;
+    %put ERROR: price_key is blank and pricefile is blank - nothing to read.;
+    %abort cancel;
+  %end;
+  %let price_n = 1;
+  %let price1 = &pricefile;
+  data work._price_files;
+    length fname $ 512 fpath $ 1000;
+    fname = compress(scan("&pricefile", -1, '\'));
+    fpath = "&pricefile";
+    output;
+  run;
+%end;
+
+%_prep_group(price, PRICE LIST, &price_n);
+%let PHN = &_hn;
+%let PDLB = &_db;
+
+/* ask for tier columns / item id columns (or require config in batch) -- */
+%_ask_inputs;
+%_expand_tiers;
+
+/* =========================================================== */
+/* ====================== STEP 1 - PRICE LIST ================ */
+/* =========================================================== */
+
+/* 1D. Scan all price files once: longest id / character column ----------- */
+data _null_;
+  length line $ 32767 _f $ 1000 prev $ 1000;
+  retain maxpid 0 %if &nmeta > 0 %then %do; %do j = 1 %to &nmeta; maxm&j 0 %end; %end; prev ' ';
+  set work._price_files end = last;
+  _f = fpath;
+  if _f ne prev then newfile = 1; else newfile = 0;
+  prev = _f;
+  infile dmy filevar=_f lrecl = 32767 truncover end = ef;
+  do while (not ef);
+    input @1 line $char32767.;
+    if newfile then rownum = 0;
+    rownum + 1;
+    line = compress(line, '0A0D'x);
+    if rownum > 1 then do;
+      mp = length(strip(scan(line, &price_itemid, byte(&PDLB), 'm')));
+      if mp > maxpid then maxpid = mp;
+      %if &nmeta > 0 %then %do;
+        %do j = 1 %to &nmeta;
+          mm = length(strip(scan(line, &&M&j, byte(&PDLB), 'm')));
+          if mm > maxm&j then maxm&j = mm;
+        %end;
+      %end;
+    end;
+  end;
+  if last then do;
+    call symputx('MAXPID', put(maxpid, 8.));
+    %if &nmeta > 0 %then %do;
+      %do j = 1 %to &nmeta;
+        call symputx(cats('MAXM&j'), put(maxm&j, 8.));
+      %end;
+    %end;
+  end;
+run;
+
+%let maxpid = %sysfunc(max(%eval(&maxpid + 0), 1));
+%if &nmeta > 0 %then %do;
+  %do j = 1 %to &nmeta;
+    %let MAXM&j = %sysfunc(max(%eval(&&MAXM&j + 0), 1));
+  %end;
+%end;
+
+/* 1E. Read the data (all matched price files, header skipped) -------------- */
+data workarea.pricelist(label = 'vendor price list');
+  length productid $ &maxpid
+         %if &nmeta > 0 %then %do;
+           %do j = 1 %to &nmeta; cm&j $ &&MAXM&j %end;
+         %end;
+         p1-p&ntier 8;
+  array p[*] p1-p&ntier;
+  %if &nmeta > 0 %then %do;
+    array cm[*] cm1-cm&nmeta;
+  %end;
+  length line $ 32767 _f $ 1000;
+  retain prev ' ';
+  set work._price_files;
+  _f = fpath;
+  if _f ne prev then newfile = 1; else newfile = 0;
+  prev = _f;
+  infile dmy1 filevar=_f lrecl = 32767 truncover end = ef1;
+  do while (not ef1);
+    input @1 line $char32767.;
+    if newfile then rownum = 0;
+    rownum + 1;
+    if rownum > 1 then do;                 /* skip header row */
+      line = compress(line, '0A0D'x);
+      productid = strip(compress(scan(line, &price_itemid, byte(&PDLB), 'm'), '"'));
+      %do k = 1 %to &ntier;
+        p[&k] = input(compress(scan(line, &&T&k, byte(&PDLB), 'm'),
+                               '"$ ,' || '0D0A'x), best32.);
+      %end;
+      %if &nmeta > 0 %then %do;
+        %do j = 1 %to &nmeta;
+          cm[&j] = strip(compress(scan(line, &&M&j, byte(&PDLB), 'm'), '"'));
+        %end;
+      %end;
+      if productid ne ' ' then output;
+    end;
+  end;
+  drop line _f prev rownum newfile;
+run;
+
+/* 1C. Tier names/positions (tier_meta), long lookup (price_tiers) ---------- */
+data workarea.tier_meta(keep = tierpos colpos tiername);
+  length tiername $ 256;
+  %do k = 1 %to &ntier;
+    tierpos  = &k;
+    colpos   = &&T&k;
+    tiername = "&&TN&k";
+    output;
+  %end;
+run;
+
+proc sql noprint;
+  select coalesce(max(length(trim(tiername))), 32) into :maxtname trimmed
+  from workarea.tier_meta;
+quit;
+
+data workarea.price_tiers(keep = productid tiername tierprice);
+  length productid $ &maxpid tiername $ &maxtname;
+  if _n_ = 1 then do;
+    declare hash tm(dataset : "workarea.tier_meta");
+    tm.defineKey('tierpos');
+    tm.defineData('tiername');
+    tm.defineDone();
+    call missing(tierpos);
+  end;
+  set workarea.pricelist(keep = productid p1-p&ntier);
+  array p[*] p1-p&ntier;
+  do tierpos = 1 to &ntier;
+    if p[tierpos] > .z then do;
+      rc = tm.find();
+      if rc = 0 then do;
+        tierprice = round(p[tierpos], 0.01);
+        output;
+      end;
+    end;
+  end;
+run;
+
+proc sort data = workarea.price_tiers nodupkey out = workarea.price_tiers;
+  by productid tierprice tiername;
+run;
+
+%put NOTE: STEP 1 complete - WORKAREA.PRICELIST (wide), TIER_META (names),;
+%put        PRICE_TIERS (long). &ntier tiers at positions %do k = 1 %to &ntier; &&T&k %end;;
+
+/* =========================================================== */
+/* ====================== STEP 2 - PURCHASES ================= */
+/* =========================================================== */
+
+%if %length(%superq(purchase_key)) > 0 %then %do;
+  %_pick_files(&purchase_key, sales);
+  %if &sales_n = 0 %then %do;
+    %put ERROR: no *.&ext files in &folder contain "&purchase_key".;
+    %abort cancel;
+  %end;
+%end;
+%else %do;
+  %if %length(%superq(purchases)) = 0 %then %do;
+    %put ERROR: purchase_key is blank and purchases is blank - nothing to read.;
+    %abort cancel;
+  %end;
+  %let sales_n = 1;
+  %let sales1 = &purchases;
+  data work._sales_files;
+    length fname $ 512 fpath $ 1000;
+    fname = compress(scan("&purchases", -1, '\'));
+    fpath = "&purchases";
+    output;
+  run;
+%end;
+
+%_prep_group(sales, PURCHASES, &sales_n);
+%let SHN = &_hn;
+%let SDLB = &_db;
+
+%if (&sale_item < 1 or &sale_item > &SHN) or
+    (&sale_cust < 1 or &sale_cust > &SHN) or
+    (&sale_qty < 1 or &sale_qty > &SHN) or
+    (&sale_charges < 1 or &sale_charges > &SHN) %then %do;
+  %put ERROR: a purchase column position is outside 1..&SHN.;
+  %abort cancel;
+%end;
+
+/* 2A. Scan purchases once: longest customerid / productid ------------------ */
+data _null_;
+  length line $ 32767 _f $ 1000 prev $ 1000;
+  retain maxcust 0 maxprod 0 prev ' ';
+  set work._sales_files end = last;
+  _f = fpath;
+  if _f ne prev then newfile = 1; else newfile = 0;
+  prev = _f;
+  infile dmy2 filevar=_f lrecl = 32767 truncover end = ef2;
+  do while (not ef2);
+    input @1 line $char32767.;
+    if newfile then rownum = 0;
+    rownum + 1;
+    line = compress(line, '0A0D'x);
+    if rownum > 1 then do;                 /* skip header row */
+      mc = length(strip(scan(line, &sale_cust, byte(&SDLB), 'm')));
+      mp = length(strip(scan(line, &sale_item, byte(&SDLB), 'm')));
+      if mc > maxcust then maxcust = mc;
+      if mp > maxprod then maxprod = mp;
+    end;
+  end;
+  if last then do;
+    call symputx('MAXCUST', put(maxcust, 8.));
+    call symputx('MAXPROD', put(maxprod, 8.));
+  end;
+run;
+%let maxcust = %sysfunc(max(%eval(&maxcust + 0), 1));
+%let maxprod = %sysfunc(max(%eval(&maxprod + 0), 1));
+
+/* 2B. Read all purchases (merged when several files share the schema) ------ */
+data workarea.purchases(label = 'purchases');
+  length customerid $ &maxcust productid $ &maxprod line $ 32767 _f $ 1000;
+  retain prev ' ';
+  set work._sales_files;
+  _f = fpath;
+  if _f ne prev then newfile = 1; else newfile = 0;
+  prev = _f;
+  infile dmy3 filevar=_f lrecl = 32767 truncover end = ef3;
+  do while (not ef3);
+    input @1 line $char32767.;
+    if newfile then rownum = 0;
+    rownum + 1;
+    if rownum > 1 then do;                 /* skip header row */
+      line = compress(line, '0A0D'x);
+      customerid = strip(scan(line, &sale_cust, byte(&SDLB), 'm'));
+      productid  = strip(compress(scan(line, &sale_item, byte(&SDLB), 'm'), '"'));
+      qty  = input(compress(scan(line, &sale_qty, byte(&SDLB), 'm'), ','), best32.);
+      paid = input(compress(scan(line, &sale_charges, byte(&SDLB), 'm'), '$,-'), best32.);
+      if productid ne ' ' then output;
+    end;
+  end;
+  drop line _f prev rownum newfile;
+run;
+
+/* 2C. De-duplicated tier lookup table (product, unit price, tier name) --- */
+data workarea.pt_key(keep = productid price tiername);
+  length productid $ &maxprod tiername $ &maxtname;
+  set workarea.price_tiers(keep = productid tierprice tiername);
+  productid = strip(productid);
+  tiername  = strip(tiername);
+  price     = round(tierprice, 0.01);
+run;
+
+proc sort data = workarea.pt_key nodupkey;
+  by productid price tiername;
+run;
+
+%put NOTE: STEP 2 complete - WORKAREA.PURCHASES (merged &sales_n file(s)), PT_KEY lookup.;
+
+/* =========================================================== */
+/* ====================== STEP 3 - COMPARE =================== */
+/* =========================================================== */
+
+/* 3A. Single-pass count: per-unit price looked up in the tier hash ------- */
+data _null_;
+  length productid $ &maxprod price 8 tiername $ &maxtname usages 8 units 8;
+
+  declare hash h(dataset  : 'workarea.pt_key',
+                 multidata: 'Y');
+  h.defineKey('productid', 'price');
+  h.defineData('tiername');
+  h.defineDone();
+
+  declare hash cnt();
+  cnt.defineKey('tiername');
+  cnt.defineData('usages', 'units');
+  cnt.defineDone();
+
+  match      = 0;
+  nomatch    = 0;
+  zero_rows  = 0;
+  zero_units = 0;
+  badsale    = 0;
+  nrows      = 0;
+
+  set workarea.purchases end = eof;
+  nrows + 1;
+  if paid ne . and qty > 0 then do;
+    price = round(paid / qty, 0.01);
+    rc    = h.find();
+    if rc = 0 then do;
+      match = match + 1;
+      do while (rc = 0);
+        if cnt.find() ne 0 then do;
+          usages = 1;
+          units  = qty;
+          cnt.add();
+        end;
+        else do;
+          usages = usages + 1;
+          units  = units + qty;
+          cnt.replace();
+        end;
+        rc = h.find_next();
+      end;
+    end;
+    else if paid = 0 then do;
+      zero_rows  = zero_rows + 1;
+      zero_units = zero_units + qty;
+    end;
+    else nomatch = nomatch + 1;
+  end;
+  else if paid ne . or qty ne . then badsale = badsale + 1;
+
+  if eof then do;
+    cnt.output(dataset : 'workarea.tier_usage');
+    call symputx('TROWS',   nrows);
+    call symputx('TMATCH',  match);
+    call symputx('TNOMATCH', nomatch);
+    call symputx('TZERO',   zero_rows);
+    call symputx('TZUNITS', zero_units);
+    call symputx('TBAD',    badsale);
+  end;
+run;
+
+data workarea.tier_usage(rename = (tiername = TierName usages = UsageCount units = TotalUnits));
+  set workarea.tier_usage;
+run;
+
+proc sort data = workarea.tier_usage;
+  by descending UsageCount;
+run;
+
+%put NOTE: STEP 3 - &TROWS purchase rows read (merged).;
+%put NOTE: STEP 3 - &TMATCH purchase rows used a listed tier price.;
+%put NOTE: STEP 3 - &TNOMATCH purchase rows did not match any listed tier price.;
+%put NOTE: STEP 3 - &TZERO zero dollar amount rows (totaling &TZUNITS units) excluded from tier usage.;
+%put NOTE: STEP 3 - &TBAD purchase rows skipped (missing/zero qty or missing paid).;
+
+/* 3B. Write the CSV output file ------------------------------------------- */
+proc export data = workarea.tier_usage
+  dbms   = csv
+  outfile = "&workarea.\&outcsv"
+  replace;
+run;
+
+%put NOTE: STEP 3 complete - wrote used price tiers to &workarea.\&outcsv;
