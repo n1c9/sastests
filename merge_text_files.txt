@@ -1,0 +1,526 @@
+/*****************************************************************************
+ *  merge_text_files.sas
+ *
+ *  Search a folder for text files containing a user-defined string,
+ *  auto-detect delimiter, validate identical schema across files,
+ *  clean header names to be SAS-friendly, then import and merge all
+ *  files into one master dataset with dynamic CHAR lengths (max 100).
+ *
+ *  Features:
+ *    - Case-insensitive filename search
+ *    - Delimiter auto-detection (TAB, PIPE, COMMA, SEMICOLON)
+ *    - Schema validation (column count, names, delimiter must match)
+ *    - Header cleaning: special chars -> _, collapse __, trim _, prefix digits
+ *    - Two-pass: scan for max lengths + samples, then import with dynamic lengths
+ *    - Quoted field support (scan 'm' modifier)
+ *    - Empty fields become '' (empty string)
+ *    - Configurable header row (0 = auto-generate _Column1..N)
+ *    - Sample values printed to log (first N non-blank per column)
+ *    - Progress logging every N rows
+ *
+ *  CONFIG section at top - edit before running
+ *****************************************************************************/
+
+/* ====================== CONFIG - edit before running ================= */
+%let folder            = C:\sas_vendor_pricing\data;  /* input folder (flat) */
+%let search_str        = prices;                       /* string in filename (case-insensitive) */
+%let ext               = txt;                          /* file extension */
+%let delim             = AUTO;                         /* AUTO | TAB | PIPE | COMMA | SEMICOLON */
+%let header_row        = 1;                            /* 1=row 1 header; 0=auto _Column1..N */
+%let sample_rows       = 1000;                         /* total rows scanned across ALL files for samples (0=all) */
+%let max_samples_col   = 5;                            /* max non-blank samples to show PER column */
+%let progress_interval = 500000;                       /* log progress every N rows (0=disable) */
+%let outlib            = workarea;                     /* permanent libref */
+%let outdsn            = merged_files;                 /* output dataset name */
+%let samples_dsn       = merged_files_samples;         /* sample values dataset */
+
+options compress = yes nofullstimer;
+
+/* ====================== USER-DEFINED MACROS ========================= */
+
+/* Expand a user-supplied column list ("3 5 7" / "3-5,9") to positions  */
+%macro _expand(in);
+  %local tok i a b out;
+  %let out = ;
+  %let in  = %sysfunc(tranwrd(%superq(in), %str(,), %str( )));
+  %let in  = %sysfunc(compbl(%superq(in)));
+  %do %while (%length(%scan(&in, 1, %str( ))) > 0);
+    %let tok = %scan(&in, 1, %str( ));
+    %let in  = %substr(%superq(in), %eval(%length(&tok) + 2));
+    %if %index(&tok, -) > 0 %then %do;
+      %let a = %scan(&tok, 1, -);
+      %let b = %scan(&tok, 2, -);
+      %do i = &a %to &b;
+        %let out = &out &i;
+      %end;
+    %end;
+    %else %let out = &out &tok;
+  %end;
+  &out
+%mend;
+
+/* map a configured &delim value to byte + name; AUTO leaves dlb blank --- */
+%macro _dlmset;
+  %global dlb dln;
+  %if %upcase(&delim) = TAB       %then %do; %let dlb = 9;   %let dln = TAB;       %end;
+  %else %if %upcase(&delim) = PIPE or %superq(delim) = %str(|) %then
+                                       %do; %let dlb = 124; %let dln = PIPE;     %end;
+  %else %if %upcase(&delim) = COMMA or %superq(delim) = %str(,) %then
+                                       %do; %let dlb = 44;  %let dln = COMMA;    %end.
+  %else %if %upcase(&delim) = SEMICOLON or %superq(delim) = %str(;) %then
+                                       %do; %let dlb = 59;  %let dln = SEMICOLON;%end.
+  %else %if %upcase(&delim) = AUTO  %then %do; %let dlb = ;   %let dln = AUTO;      %end.
+  %else %do;
+    %put ERROR: delim=&delim not recognized - use AUTO, TAB, |, , or ;.;
+    %abort cancel;
+  %end.
+%mend;
+
+/* detect the delimiter of one file (first 5 lines), stores &dlb &dln ---- */
+%macro _detect_delim(fp);
+  %global dlb dln;
+  data _null_;
+    length line $ 32767;
+    infile "&fp" lrecl = 32767 truncover end = last;
+    input @1 line $char32767.;
+    if _n_ <= 5 then do;
+      tt + countc(line, '09'x);
+      pp + countc(line, '7C'x);
+      cc + countc(line, ',');
+      ss + countc(line, ';');
+    end;
+    if (last or _n_ = 5) then do;
+      if tt >= pp and tt >= cc and tt >= ss then do; b = 9;   nm = 'TAB';       end;
+      else if pp >= cc and pp >= ss then do; b = 124; nm = 'PIPE';     end;
+      else if cc >= ss then do; b = 44;  nm = 'COMMA';    end;
+      else do; b = 59;  nm = 'SEMICOLON'; end;
+      call symputx('dlb', put(b, 3.));
+      call symputx('dln', nm);
+      stop;
+    end;
+  run;
+%mend;
+
+/* scan &folder for *.&ext files whose name contains &key (case-insensitive);
+   builds &tag.1.. with full paths and &tag_n = count (global macro vars);
+   deduplicates by full path                                            */
+%macro _pick_files(key, tag);
+  %global &tag._n;
+  filename _ddir pipe "dir /b ""&folder""";
+  data work._&tag._files;
+    length fname $ 512 fpath $ 1000;
+    infile _ddir truncover;
+    input @1 fname $char512.;
+    if compress(fname) ne ' ' then do;
+      up = upcase(fname);
+      upkey = upcase("&key");
+      if index(up, upkey) > 0 then do;
+        dot = find(up, '.', -length(up));
+        ext = ifc(dot > 0, substr(up, dot + 1), ' ');
+        if ext = upcase("&ext") then do;
+          fpath = "&folder" || '\' || strip(fname);
+          output;
+        end;
+      end;
+    end;
+    keep fname fpath;
+  run;
+  /* deduplicate by full path */
+  proc sort data=work._&tag._files nodupkey out=work._&tag._files2;
+    by fpath;
+  run;
+  data _null_;
+    set work._&tag._files2 end=last;
+    if _n_ = 1 then do;
+      call symputx('&tag._n', 0);
+    end;
+    call symputx(cats("&tag", _n_ + 1), fpath);
+    call symputx('&tag._n', _n_);
+    if last then call symputx('&tag._n', _n_);
+  run;
+  %put NOTE: [&tag] matched &&&tag._n file(s) containing "&key":;
+  %do _i = 1 %to &&&tag._n;
+    %put        &_i) &&&tag&_i;
+  %end;
+%mend;
+
+/* read header row from a file (or generate _Column1..N if header_row=0)  */
+%macro _read_header(fp, tag);
+  %global _hn _h1-_h&sysmaxlong;
+  %local i line n;
+  %if &header_row = 0 %then %do;
+    /* generate _Column1..N - but we need to know N first */
+    /* read first data row to count columns */
+    data _null_;
+      length line $ 32767;
+      infile "&fp" obs=1 lrecl=32767 truncover;
+      input @1 line $char32767.;
+      line = compress(line, '0A0D'x);
+      n = countc(line, byte(&dlb)) + 1;
+      call symputx('_hn', put(n, 8.));
+      %do i = 1 %to 1000; /* upper bound */
+        %if &i <= &n %then %do;
+          call symputx(cats('_h', &i), cats('_Column', &i));
+        %end;
+      %end;
+    run;
+  %end;
+  %else %do;
+    data _null_;
+      length line $ 32767;
+      infile "&fp" obs=&header_row lrecl=32767 truncover;
+      input @1 line $char32767.;
+      if _n_ = &header_row then do;
+        line = compress(line, '0A0D'x);
+        n = countc(line, byte(&dlb)) + 1;
+        call symputx('_hn', put(n, 8.));
+        do k = 1 to n;
+          t = strip(scan(line, k, byte(&dlb), 'm'));
+          /* remove surrounding quotes if present */
+          if length(t) >= 2 and substr(t,1,1) = '"' and substr(t,length(t),1) = '"' then
+            t = substr(t, 2, length(t)-2);
+          call symputx(cats('_h', k), t);
+        end;
+      end;
+    run;
+  %end;
+%mend;
+
+/* clean header names to be SAS-valid:
+   - replace special chars with _
+   - collapse multiple _ to single _
+   - trim leading/trailing _
+   - prefix with _ if starts with digit
+   - truncate to 32 chars
+   - ensure uniqueness (append _2, _3 if duplicate) */
+%macro _clean_headers;
+  %global _hn _ch1-_ch&sysmaxlong;
+  %local i j clean seen dup;
+  %let seen = ;
+  %do i = 1 %to &_hn;
+    %let raw = &&_h&i;
+    /* replace special chars with _ */
+    %let clean = %sysfunc(translate(%superq(raw), %str(_), %str( ~!@#$%^&*()-+={}[]|\:;"<>?,./)));
+    /* collapse multiple _ */
+    %let clean = %sysfunc(prxchange(%str(s/__+/_/), -1, %superq(clean)));
+    /* trim leading/trailing _ */
+    %let clean = %sysfunc(prxchange(%str(s/^_+|_+$//), -1, %superq(clean)));
+    /* prefix if starts with digit */
+    %if %sysfunc(prxmatch(%str(/^[0-9]/), %superq(clean))) %then %let clean = _%superq(clean);
+    /* truncate to 32 */
+    %let clean = %substr(%superq(clean), 1, 32);
+    /* ensure uniqueness */
+    %let dup = 0;
+    %let base = &clean;
+    %do %while(%sysfunc(index(%superq(seen), %str(|) || %superq(clean) || %str(|))) > 0);
+      %let dup = %eval(&dup + 1);
+      %let clean = &base._&dup;
+    %end;
+    %let seen = &seen|&clean|;
+    %let _ch&i = &clean;
+    %put NOTE:   Cleaned header &i: "&&_h&i" -> &clean;
+  %end;
+%mend;
+
+/* validate schema across all files: column count, raw header names, delimiter */
+%macro _validate_schema(tag, ctr);
+  %global _db _dn _hn;
+  %local i;
+  %do i = 1 %to &ctr;
+    %let _f = &&&tag&i;
+    %if &dln = AUTO %then %do;
+      %_detect_delim(&_f);
+      %let db_&i = &dlb;
+      %let dln_&i = &dln;
+    %end;
+    %else %do;
+      %let db_&i = &dlb;
+      %let dln_&i = &dln;
+    %end;
+    %_read_header(&_f, _tmp);
+    %let hn_&i = &_hn;
+    %do k = 1 %to &_hn;
+      %let h&k._&i = &&_h&k;
+    %end;
+    %let sig_&i = ;
+    %do k = 1 %to &_hn;
+      %let sig_&i = %superq(sig_&i)||~||&&_h&k;
+    %end;
+  %end;
+  %do i = 2 %to &ctr;
+    %if &&hn_&i ne &hn_1 %then %do;
+      %put ERROR: File &i has different column count than file 1 (&&hn_&i vs &hn_1).;
+      %put        File 1: &&&tag1;
+      %put        File &i: &&&tag&i;
+      %abort cancel;
+    %end;
+    %if %qupcase(&&sig_&i) ne %qupcase(&sig_1) %then %do;
+      %put ERROR: File &i header differs from file 1.;
+      %put        File 1: &sig_1;
+      %put        File &i: &&sig_&i;
+      %abort cancel;
+    %end;
+    %if &dln = AUTO %then %do;
+      %if &&db_&i ne &db_1 %then %do;
+        %put ERROR: File &i uses different delimiter than file 1 (&&dln_&i vs &dln_1).;
+        %put        File 1: &&&tag1;
+        %put        File &i: &&&tag&i;
+        %abort cancel;
+      %end;
+    %end;
+  %end;
+  %let _db = &db_1;
+  %let _dn = &dln_1;
+  %let _hn = &hn_1;
+  %put NOTE: Detected delimiter: &_dn (byte &_db).;
+  %put NOTE: Schema validated: &_hn columns across all &ctr file(s).;
+  %put NOTE: Raw headers: %do _k = 1 %to &_hn; &&_h&_k %end;;
+%mend;
+
+/* Pass 1: scan all files to determine max column lengths (capped at 100)
+   and collect first &max_samples_col non-blank values per column       */
+%macro _scan_pass(tag, ctr);
+  %global _hn;
+  %local i max_samples total_rows;
+  %let max_samples = &max_samples_col;
+  %let total_rows = 0;
+
+  /* initialize macro vars for max lengths */
+  %do i = 1 %to &_hn;
+    %let maxlen_&i = 0;
+  %end;
+
+  data _null_;
+    length line $ 32767 _f $ 1000 prev $ 1000 val $ 32767;
+    array maxlen[&_hn] _temporary_;
+    retain prev ' ' total_rows 0;
+
+    set work._&tag._files2 end=lastfile;
+    _f = fpath;
+    if _f ne prev then newfile = 1; else newfile = 0;
+    prev = _f;
+
+    infile dmy filevar=_f lrecl=32767 truncover end=eof;
+    do while (not eof);
+      input @1 line $char32767.;
+      if newfile then do;
+        rownum = 0;
+        newfile = 0;
+      end;
+      rownum + 1;
+      if rownum > &header_row then do;
+        total_rows + 1;
+        line = compress(line, '0A0D'x);
+        do col = 1 to &_hn;
+          val = strip(scan(line, col, byte(&_db), 'm'));
+          /* handle quoted empty string */
+          if val = '""' then val = '';
+          /* track max length */
+          vl = length(val);
+          if vl > maxlen[col] then maxlen[col] = min(vl, 100);
+        end;
+        /* progress logging */
+        %if &progress_interval > 0 %then %do;
+          if mod(total_rows, &progress_interval) = 0 then do;
+            put 'NOTE:   Pass 1 progress: ' total_rows 'rows scanned...';
+          end;
+        %end;
+        /* stop if sample_rows limit reached */
+        %if &sample_rows > 0 %then %do;
+          if total_rows >= &sample_rows then do;
+            eof = 1;
+            leave;
+          end;
+        %end;
+      end;
+    end;
+    if lastfile then do;
+      do col = 1 to &_hn;
+        call symputx(cats('maxlen_', col), put(maxlen[col], 8.));
+      end;
+      call symputx('total_rows_pass1', put(total_rows, 8.));
+    end;
+  run;
+
+  %put NOTE: PASS 1 complete - scanned &total_rows_pass1 rows across &ctr file(s).;
+  %put NOTE: Column lengths (capped at 100):;
+  %do i = 1 %to &_hn;
+    %put        &&_ch&i = &&maxlen_&i;
+  %end;
+
+  /* Pass 1b: collect sample values into a dataset */
+  %_collect_samples(&tag, &ctr);
+%mend;
+
+/* Collect first &max_samples_col non-blank values per column into a WIDE dataset */
+%macro _collect_samples(tag, ctr);
+  %global _hn;
+  %local max_samples;
+  %let max_samples = &max_samples_col;
+
+  data &outlib..&samples_dsn(label = 'Sample values for &search_str');
+    length column_name $ 32
+      %do j = 1 %to &max_samples;
+        sample_&j $ 100
+      %end;
+      ;
+    array samp_cnt[&_hn] _temporary_;
+    array samp_val[&_hn, &max_samples] $ 100 _temporary_;
+    length line $ 32767 _f $ 1000 prev $ 1000 val $ 32767;
+    retain prev ' ' total_rows 0;
+
+    set work._&tag._files2 end=lastfile;
+    _f = fpath;
+    if _f ne prev then newfile = 1; else newfile = 0;
+    prev = _f;
+
+    infile dmy filevar=_f lrecl=32767 truncover end=eof;
+    do while (not eof);
+      input @1 line $char32767.;
+      if newfile then do;
+        rownum = 0;
+        newfile = 0;
+      end;
+      rownum + 1;
+      if rownum > &header_row then do;
+        total_rows + 1;
+        line = compress(line, '0A0D'x);
+        do col = 1 to &_hn;
+          val = strip(scan(line, col, byte(&_db), 'm'));
+          if val = '""' then val = '';
+          if val ne '' and samp_cnt[col] < &max_samples then do;
+            samp_cnt[col] + 1;
+            samp_val[col, samp_cnt[col]] = val;
+          end;
+        end;
+        %if &sample_rows > 0 %then %do;
+          if total_rows >= &sample_rows then do;
+            eof = 1;
+            leave;
+          end;
+        %end;
+      end;
+    end;
+    if lastfile then do;
+      do col = 1 to &_hn;
+        column_name = "&&_ch&col";
+        %do j = 1 %to &max_samples;
+          sample_&j = samp_val[col, &j];
+        %end;
+        output;
+      end;
+    end;
+  run;
+
+  %put NOTE: Sample values written to &outlib..&samples_dsn;
+%mend;
+
+/* Pass 2: import all files with dynamic CHAR lengths, merge into master */
+%macro _import_merge(tag, ctr);
+  %global _hn;
+  %local i;
+
+  /* build length statement */
+  %let length_stmt = ;
+  %do i = 1 %to &_hn;
+    %let len = &&maxlen_&i;
+    %if &len = 0 %then %let len = 1;
+    %let length_stmt = &length_stmt &&_ch&i $ &len;
+  %end;
+
+  data &outlib..&outdsn(label = 'Merged text files: &search_str');
+    length &length_stmt;
+    length line $ 32767 _f $ 1000 prev $ 1000 val $ 32767;
+    retain prev ' ' total_rows 0;
+
+    set work._&tag._files2 end=lastfile;
+    _f = fpath;
+    if _f ne prev then newfile = 1; else newfile = 0;
+    prev = _f;
+
+    infile dmy filevar=_f lrecl=32767 truncover end=eof;
+    do while (not eof);
+      input @1 line $char32767.;
+      if newfile then do;
+        rownum = 0;
+        newfile = 0;
+      end;
+      rownum + 1;
+      if rownum > &header_row then do;
+        total_rows + 1;
+        line = compress(line, '0A0D'x);
+        %do i = 1 %to &_hn;
+          val = strip(scan(line, &i, byte(&_db), 'm'));
+          if val = '""' then val = '';
+          &&_ch&i = val;
+        %end;
+        output;
+        %if &progress_interval > 0 %then %do;
+          if mod(total_rows, &progress_interval) = 0 then do;
+            put 'NOTE:   Pass 2 progress: ' total_rows 'rows imported...';
+          end;
+        %end;
+      end;
+    end;
+    if lastfile then do;
+      call symputx('total_rows_pass2', put(total_rows, 8.));
+    end;
+  run;
+
+  %put NOTE: PASS 2 complete - &&total_rows_pass2 rows merged into &outlib..&outdsn;
+%mend;
+
+/* =========================================================== */
+/* ====================== MAIN EXECUTION ===================== */
+/* =========================================================== */
+
+/* STEP 0: Setup libname and verify folder */
+%if %sysfunc(libref(&outlib)) %then %do;
+  %put ERROR: Libref &outlib not assigned. Define it before running.;
+  %abort cancel;
+%end.
+
+%if not %sysfunc(fileexist(&folder)) %then %do;
+  %put ERROR: Input folder "&folder" does not exist.;
+  %abort cancel;
+%end.
+
+/* STEP 1: File Discovery */
+%_pick_files(&search_str, file);
+
+/* check if any files found */
+%if &file_n = 0 %then %do;
+  %put ERROR: No *.%ext files in &folder contain "&search_str".;
+  %abort cancel;
+%end.
+
+/* STEP 2: Delimiter Detection */
+%_dlmset;
+%if &dln = AUTO %then %do;
+  %_detect_delim(&&file1);
+%end.
+%put NOTE: Using delimiter: &dln (byte &dlb);
+
+/* STEP 3: Read Header from First File */
+%_read_header(&&file1, _tmp);
+
+/* STEP 4: Clean Headers */
+%_clean_headers;
+
+/* STEP 5: Validate Schema Across All Files */
+%_validate_schema(file, &file_n);
+
+/* STEP 6: PASS 1 - Scan for lengths and samples */
+%_scan_pass(file, &file_n);
+
+/* STEP 7: PASS 2 - Import and Merge */
+%_import_merge(file, &file_n);
+
+/* Final Summary */
+%put NOTE: ==========================================;
+%put NOTE: MERGE COMPLETE;
+%put NOTE:   Output dataset: &outlib..&outdsn;
+%put NOTE:   Total rows:     &&total_rows_pass2;
+%put NOTE:   Columns:        &_hn;
+%put NOTE:   Delimiter:      &dln;
+%put NOTE: ==========================================;
